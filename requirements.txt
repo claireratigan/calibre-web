@@ -26,3 +26,5 @@ flask-httpAuth>=4.4.0,<5.0.0
 cryptography>=39.0.0,<48.0.0
 certifi>=2024.7.4,<2026.1.5
 fake_headers>=1.0.2,<1.1.0
+cloudscraper>=1.2.71,<2.0.0
+playwright>=1.48.0,<2.0.0

@@ -1,22 +1,193 @@
 import datetime as dt
 import html
 import json
+import os
+import random
 import re
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures.thread import ThreadPoolExecutor
-from datetime import datetime
-
+from pathlib import Path
 from typing import List, Optional
 from urllib.parse import quote
 
 import bs4
-import requests
+from bs4 import BeautifulSoup
 from bs4.element import ResultSet, Tag
-from fake_headers import Headers
 
 from cps import logger
 from cps.services.Metadata import Metadata, MetaRecord, MetaSourceInfo
+
+
+SESSION_DIR = Path(os.path.expanduser("~/.goodreads_session"))
+COOKIE_FILE = SESSION_DIR / "cookies.json"
+USER_DATA_DIR = str(SESSION_DIR / "browser_profile")
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
+
+
+def _is_waf_challenge(text: str) -> bool:
+    return len(text) < 500 or (len(text) < 5000 and ("awsWaf" in text or "verify you are human" in text.lower()))
+
+
+class GoodreadsSession:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self._pw_lock = threading.Lock()
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        self._playwright = None
+        self._browser = None
+        self._page = None
+        self._make_scraper()
+
+    def _make_scraper(self):
+        import cloudscraper
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        cookies = self._load_cookies()
+        for c in cookies:
+            if "goodreads.com" in c.get("domain", ""):
+                try:
+                    scraper.cookies.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"))
+                except Exception:
+                    pass
+        self._scraper = scraper
+
+    def _load_cookies(self) -> list:
+        if COOKIE_FILE.exists():
+            return json.loads(COOKIE_FILE.read_text())
+        return []
+
+    def _save_cookies(self, cookies: list):
+        COOKIE_FILE.write_text(json.dumps(cookies, indent=2))
+
+    def _try_cloudscraper(self, url: str, params: Optional[dict] = None) -> Optional[str]:
+        headers = {
+            "User-Agent": random.choice(_USER_AGENTS),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        self._scraper.headers.update(headers)
+        try:
+            resp = self._scraper.get(url, params=params, timeout=20)
+            if resp.status_code == 200 and not _is_waf_challenge(resp.text):
+                return resp.text
+        except Exception:
+            pass
+        return None
+
+    def _ensure_browser(self):
+        if self._page is not None:
+            return
+        from playwright.sync_api import sync_playwright
+
+        self._playwright = sync_playwright().start()
+        self._browser = self._playwright.chromium.launch_persistent_context(
+            user_data_dir=USER_DATA_DIR,
+            headless=True,
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+            timezone_id="America/New_York",
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-automation",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        self._page = self._browser.new_page()
+        self._page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            window.chrome = { runtime: { } };
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            const origQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
+            window.navigator.permissions.query = (p) => (
+                p.name === 'notifications'
+                    ? Promise.resolve({ state: 'denied' })
+                    : origQuery(p)
+            );
+        """)
+
+    def _refresh_waf_token(self) -> bool:
+        self._ensure_browser()
+        try:
+            self._page.goto("https://www.goodreads.com/search?q=warmup", wait_until="load", timeout=30000)
+            time.sleep(3)
+        except Exception:
+            pass
+        try:
+            cookies = self._page.context.cookies()
+            self._save_cookies(cookies)
+            self._make_scraper()
+            return True
+        except Exception:
+            return False
+
+    def fetch(self, url: str, params: Optional[dict] = None) -> str:
+        text = self._try_cloudscraper(url, params)
+        if text is not None:
+            return text
+        with self._pw_lock:
+            text = self._try_cloudscraper(url, params)
+            if text is not None:
+                return text
+            self._refresh_waf_token()
+            text = self._try_cloudscraper(url, params)
+            if text is not None:
+                return text
+            full_url = url
+            if params:
+                qs = "&".join(f"{k}={v}" for k, v in params.items())
+                full_url = f"{url}?{qs}"
+            try:
+                self._page.goto(full_url, wait_until="load", timeout=30000)
+                time.sleep(5)
+            except Exception:
+                pass
+            return self._page.content()
+
+    def fetch_soup(self, url: str, params: Optional[dict] = None) -> Optional[BeautifulSoup]:
+        text = self.fetch(url, params)
+        if not text:
+            return None
+        return BeautifulSoup(text, "html.parser")
+
+    def close(self):
+        with self._pw_lock:
+            if self._browser:
+                try:
+                    self._browser.close()
+                except Exception:
+                    pass
+            if self._playwright:
+                try:
+                    self._playwright.stop()
+                except Exception:
+                    pass
+            self._browser = None
+            self._page = None
+            self._playwright = None
 
 # -*- coding: utf-8 -*-
 
@@ -54,21 +225,14 @@ class GoodReads(Metadata):
     ) -> Optional[List[MetaRecord]]:
         val = list()
         if self.active:
-            headers = Headers(os="mac", headers=True).generate()
             title_tokens = list(self.get_title_tokens(query, strip_joiners=False))
             if title_tokens:
                 tokens = [quote(t.encode("utf-8")) for t in title_tokens]
                 query = html.escape(" ".join(tokens))
-            try:
-                results = requests.get(
-                    GoodReads.SEARCH_URL + query,
-                    headers=headers,
-                )
-                results.raise_for_status()
-            except Exception as e:
-                log.warning(e)
+            session = GoodreadsSession()
+            soup = session.fetch_soup(GoodReads.SEARCH_URL + query)
+            if not soup:
                 return []
-            soup = bs4.BeautifulSoup(results.text, "html.parser")
             results: ResultSet = soup.find_all(
                 "tr", dict(itemtype="http://schema.org/Book")
             )
@@ -81,36 +245,30 @@ class GoodReads(Metadata):
             ]
             with ThreadPoolExecutor(max_workers=5) as executor:
                 futs = [
-                    executor.submit(
-                        GoodReads._parse_url, GoodReads.BOOK_URL + url, headers
-                    )
+                    executor.submit(GoodReads._parse_url, GoodReads.BOOK_URL + url)
                     for url in book_ids[:3]
                 ]
-                val = [fut.result() for fut in futs]
+                val = [fut.result() for fut in futs if fut.result() is not None]
 
         return val
 
     @staticmethod
-    def _parse_url(url: str, headers=None) -> MetaRecord:
-        if headers is None:
-            headers = Headers(os="mac", headers=True).generate()
-        try:
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-        except ConnectionError:
-            time.sleep(1)
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-
-        soup = bs4.BeautifulSoup(response.text, "html.parser")
-        metadata = json.loads(soup.find("script", {"id": "__NEXT_DATA__"}).text)[
-            "props"
-        ]["pageProps"]["apolloState"]
+    def _parse_url(url: str) -> Optional[MetaRecord]:
+        session = GoodreadsSession()
+        soup = session.fetch_soup(url)
+        if not soup:
+            return None
+        script = soup.find("script", {"id": "__NEXT_DATA__"})
+        if not script:
+            return None
+        metadata = json.loads(script.text)["props"]["pageProps"]["apolloState"]
         grouped_metadata = defaultdict(list)
         for k, v in metadata.items():
             if "__typename" in v:
                 grouped_metadata[v["__typename"]].append(v)
-        book = [book for book in grouped_metadata["Book"] if "title" in book][0]
+        book = next((b for b in grouped_metadata["Book"] if "title" in b), None)
+        if not book:
+            return None
         return MetaRecord(
             id=url.split("/")[-1],
             title=book["title"],

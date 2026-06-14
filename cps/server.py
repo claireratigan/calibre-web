@@ -332,6 +332,8 @@ class WebServer(object):
 
         log.info("webserver stop (restart=%s)", restart)
         self.shutdown_scheduler()
+        from cps.metadata_provider.goodreads import GoodreadsSession
+        GoodreadsSession().close()
         self.restart = restart
         if self.wsgiserver:
             if _GEVENT:
