@@ -19,6 +19,7 @@ from bs4.element import ResultSet, Tag
 from cps import logger
 from cps.services.Metadata import Metadata, MetaRecord, MetaSourceInfo
 
+log = logger.create()
 
 SESSION_DIR = Path(os.path.expanduser("~/.goodreads_session"))
 COOKIE_FILE = SESSION_DIR / "cookies.json"
@@ -53,6 +54,7 @@ class GoodreadsSession:
             return
         self._initialized = True
         self._pw_lock = threading.Lock()
+        self._browser_failed = False
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
         self._playwright = None
         self._browser = None
@@ -92,6 +94,7 @@ class GoodreadsSession:
             resp = self._scraper.get(url, params=params, timeout=20)
             if resp.status_code == 200 and not _is_waf_challenge(resp.text):
                 return resp.text
+            log.debug("Goodreads WAF on %s (status=%d, len=%d)", url, resp.status_code, len(resp.text))
         except Exception:
             pass
         return None
@@ -99,38 +102,46 @@ class GoodreadsSession:
     def _ensure_browser(self):
         if self._page is not None:
             return
-        from playwright.sync_api import sync_playwright
-
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch_persistent_context(
-            user_data_dir=USER_DATA_DIR,
-            headless=True,
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-            timezone_id="America/New_York",
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-automation",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        self._page = self._browser.new_page()
-        self._page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            window.chrome = { runtime: { } };
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            const origQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
-            window.navigator.permissions.query = (p) => (
-                p.name === 'notifications'
-                    ? Promise.resolve({ state: 'denied' })
-                    : origQuery(p)
-            );
-        """)
+        if self._browser_failed:
+            return
+        try:
+            from playwright.sync_api import sync_playwright
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch_persistent_context(
+                user_data_dir=USER_DATA_DIR,
+                headless=True,
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+                timezone_id="America/New_York",
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-automation",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            self._page = self._browser.new_page()
+            self._page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                window.chrome = { runtime: { } };
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                const origQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
+                window.navigator.permissions.query = (p) => (
+                    p.name === 'notifications'
+                        ? Promise.resolve({ state: 'denied' })
+                        : origQuery(p)
+                );
+            """)
+        except Exception as e:
+            log.warning("Goodreads Playwright browser unavailable: %s", e)
+            self._browser_failed = True
 
     def _refresh_waf_token(self) -> bool:
         self._ensure_browser()
+        if self._page is None:
+            log.warning("Goodreads: cannot refresh WAF token, browser unavailable")
+            return False
         try:
             self._page.goto("https://www.goodreads.com/search?q=warmup", wait_until="load", timeout=30000)
             time.sleep(3)
@@ -160,12 +171,15 @@ class GoodreadsSession:
             if params:
                 qs = "&".join(f"{k}={v}" for k, v in params.items())
                 full_url = f"{url}?{qs}"
-            try:
-                self._page.goto(full_url, wait_until="load", timeout=30000)
-                time.sleep(5)
-            except Exception:
-                pass
-            return self._page.content()
+            if self._page:
+                try:
+                    self._page.goto(full_url, wait_until="load", timeout=30000)
+                    time.sleep(5)
+                except Exception:
+                    pass
+                return self._page.content()
+            log.warning("Goodreads: all fetch paths exhausted for %s", url)
+            return ""
 
     def fetch_soup(self, url: str, params: Optional[dict] = None) -> Optional[BeautifulSoup]:
         text = self.fetch(url, params)
@@ -208,9 +222,6 @@ class GoodreadsSession:
 #  along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 
-log = logger.create()
-
-
 class GoodReads(Metadata):
     __name__ = "GoodReads"
     __id__ = "goodreads"
@@ -232,6 +243,7 @@ class GoodReads(Metadata):
             session = GoodreadsSession()
             soup = session.fetch_soup(GoodReads.SEARCH_URL + query)
             if not soup:
+                log.debug("Goodreads: no soup for q=%s", query)
                 return []
             results: ResultSet = soup.find_all(
                 "tr", dict(itemtype="http://schema.org/Book")
@@ -243,6 +255,9 @@ class GoodReads(Metadata):
                 .removeprefix("/book/show/")
                 for result in results
             ]
+            if not book_ids:
+                log.debug("Goodreads: no book IDs for q=%s", query)
+                return []
             with ThreadPoolExecutor(max_workers=5) as executor:
                 futs = [
                     executor.submit(GoodReads._parse_url, GoodReads.BOOK_URL + url)
@@ -260,6 +275,7 @@ class GoodReads(Metadata):
             return None
         script = soup.find("script", {"id": "__NEXT_DATA__"})
         if not script:
+            log.warning("Goodreads: __NEXT_DATA__ missing in %s", url)
             return None
         metadata = json.loads(script.text)["props"]["pageProps"]["apolloState"]
         grouped_metadata = defaultdict(list)
