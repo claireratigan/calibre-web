@@ -21,10 +21,6 @@ from cps.services.Metadata import Metadata, MetaRecord, MetaSourceInfo
 
 log = logger.create()
 
-SESSION_DIR = Path(os.path.expanduser("~/.goodreads_session"))
-COOKIE_FILE = SESSION_DIR / "cookies.json"
-USER_DATA_DIR = str(SESSION_DIR / "browser_profile")
-
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
@@ -55,12 +51,30 @@ class GoodreadsSession:
         self._initialized = True
         self._pw_lock = threading.Lock()
         self._browser_failed = False
-        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        self._session_dir = self._resolve_session_dir()
+        self._session_dir.mkdir(parents=True, exist_ok=True)
+        self._cookie_file = self._session_dir / "cookies.json"
+        self._user_data_dir = str(self._session_dir / "browser_profile")
         self._playwright = None
         self._browser = None
         self._page = None
         self._scraper = None
         self._make_scraper()
+
+    @staticmethod
+    def _resolve_session_dir():
+        candidates = [
+            Path(os.path.expanduser("~/.goodreads_session")),
+            Path("/config/goodreads_session"),
+            Path("/tmp/goodreads_session"),
+        ]
+        for path in candidates:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                return path
+            except PermissionError:
+                continue
+        return candidates[-1]
 
     def _make_scraper(self):
         import cloudscraper
@@ -77,12 +91,12 @@ class GoodreadsSession:
         self._scraper = scraper
 
     def _load_cookies(self) -> list:
-        if COOKIE_FILE.exists():
-            return json.loads(COOKIE_FILE.read_text())
+        if self._cookie_file.exists():
+            return json.loads(self._cookie_file.read_text())
         return []
 
     def _save_cookies(self, cookies: list):
-        COOKIE_FILE.write_text(json.dumps(cookies, indent=2))
+        self._cookie_file.write_text(json.dumps(cookies, indent=2))
 
     def _try_cloudscraper(self, url: str, params: Optional[dict] = None) -> Optional[str]:
         if self._scraper is None:
@@ -113,7 +127,7 @@ class GoodreadsSession:
             from playwright.sync_api import sync_playwright
             self._playwright = sync_playwright().start()
             self._browser = self._playwright.chromium.launch_persistent_context(
-                user_data_dir=USER_DATA_DIR,
+                user_data_dir=self._user_data_dir,
                 headless=True,
                 viewport={"width": 1280, "height": 800},
                 locale="en-US",
