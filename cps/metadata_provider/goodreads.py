@@ -59,6 +59,7 @@ class GoodreadsSession:
         self._playwright = None
         self._browser = None
         self._page = None
+        self._scraper = None
         self._make_scraper()
 
     def _make_scraper(self):
@@ -84,6 +85,10 @@ class GoodreadsSession:
         COOKIE_FILE.write_text(json.dumps(cookies, indent=2))
 
     def _try_cloudscraper(self, url: str, params: Optional[dict] = None) -> Optional[str]:
+        if self._scraper is None:
+            self._make_scraper()
+        if self._scraper is None:
+            return None
         headers = {
             "User-Agent": random.choice(_USER_AGENTS),
             "Accept-Language": "en-US,en;q=0.9",
